@@ -10,7 +10,7 @@ Archive your Claude Code conversations into a searchable SQLite database. Single
 
 Claude Code stores session history as JSONL files under `~/.claude/projects/`, but these files have problems:
 
-- **Files are deleted by default** — Sessions are auto-deleted after 30 days (`cleanupPeriodDays` setting). Even if you change this, the other issues remain.
+- **Files are deleted by default** — Old sessions are auto-deleted over time (`cleanupPeriodDays` setting). Even if you change this, the other issues remain.
 - **Data loss on compact** — `/compact` compresses in-memory context, and the original conversation details are lost
 - **Poor searchability** — JSONL files are scattered across directories with no cross-session search
 
