@@ -4,17 +4,17 @@
 [![Crates.io](https://img.shields.io/crates/v/claude-vault.svg)](https://crates.io/crates/claude-vault)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Your Claude Code conversations disappear after 30 days. claude-vault archives them permanently — searchable, single binary, zero dependencies.
+Archive your Claude Code conversations into a searchable SQLite database. Single binary, zero dependencies.
 
 ## Why?
 
-Claude Code stores session history as JSONL files under `~/.claude/projects/`, but these files are fragile:
+Claude Code stores session history as JSONL files under `~/.claude/projects/`, but these files have problems:
 
-- **Files disappear** — Old session JSONL files are deleted over time, and your history is gone forever
+- **Files are deleted by default** — Sessions are auto-deleted after 30 days (`cleanupPeriodDays` setting). Even if you change this, the other issues remain.
 - **Data loss on compact** — `/compact` compresses in-memory context, and the original conversation details are lost
 - **Poor searchability** — JSONL files are scattered across directories with no cross-session search
 
-Tools that read JSONL directly (TUI viewers, history browsers) lose access when these files vanish. claude-vault solves this by copying conversations into a durable SQLite database — once archived, your history survives file deletion, compaction, and cleanup. Zero runtime dependencies, single binary.
+claude-vault copies conversations into a durable SQLite database with full-text search — once archived, your history survives file deletion, compaction, and cleanup. Zero runtime dependencies, single binary.
 
 ## Demo
 
