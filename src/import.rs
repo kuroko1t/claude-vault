@@ -71,6 +71,7 @@ fn clean_content(content: &str) -> String {
         "command-name",
         "command-message",
         "command-args",
+        "task-notification",
     ];
     for tag in &tag_patterns {
         while let Some(start) = result.find(&format!("<{tag}>")) {
