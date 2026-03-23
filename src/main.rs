@@ -57,6 +57,9 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Include tool_use lines in results (hidden by default)
+        #[arg(long)]
+        include_tools: bool,
     },
     /// Export a session in various formats
     Export {
@@ -118,6 +121,15 @@ fn format_project_name(raw: &str) -> String {
     db::format_project_name(raw)
 }
 
+/// Remove lines that start with `[tool_use: ` from content.
+fn strip_tool_lines(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| !line.starts_with("[tool_use: "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn default_db_path() -> Result<PathBuf> {
     let data_dir = dirs::data_dir().context("Could not determine data directory")?;
     let vault_dir = data_dir.join("claude-vault");
@@ -171,6 +183,7 @@ fn run() -> Result<()> {
             since,
             until,
             json,
+            include_tools,
         } => {
             let results = db::search(
                 &conn,
@@ -181,17 +194,26 @@ fn run() -> Result<()> {
                 since.as_deref(),
                 until.as_deref(),
             )?;
+            let strip = !include_tools;
             if json {
                 let json_results: Vec<serde_json::Value> = results
                     .iter()
-                    .map(|r| {
-                        serde_json::json!({
+                    .filter_map(|r| {
+                        let content = if strip {
+                            strip_tool_lines(&r.content)
+                        } else {
+                            r.content.clone()
+                        };
+                        if strip && content.trim().is_empty() {
+                            return None;
+                        }
+                        Some(serde_json::json!({
                             "session_id": r.session_id,
                             "project": format_project_name(&r.project),
                             "role": r.role,
-                            "content": r.content,
+                            "content": content,
                             "timestamp": r.timestamp,
-                        })
+                        }))
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&json_results)?);
@@ -201,8 +223,17 @@ fn run() -> Result<()> {
                 println!("No results found.");
                 return Ok(());
             }
-            for (i, r) in results.iter().enumerate() {
-                if i > 0 {
+            let mut printed = 0;
+            for r in results.iter() {
+                let content = if strip {
+                    strip_tool_lines(&r.content)
+                } else {
+                    r.content.clone()
+                };
+                if strip && content.trim().is_empty() {
+                    continue;
+                }
+                if printed > 0 {
                     println!("---");
                 }
                 let project = format_project_name(&r.project);
@@ -213,13 +244,17 @@ fn run() -> Result<()> {
                     r.session_id,
                     r.timestamp.as_deref().unwrap_or("unknown")
                 );
-                let content: String = if r.content.chars().count() > 300 {
-                    let truncated: String = r.content.chars().take(300).collect();
+                let content: String = if content.chars().count() > 300 {
+                    let truncated: String = content.chars().take(300).collect();
                     format!("{truncated}...")
                 } else {
-                    r.content.clone()
+                    content
                 };
                 println!("{}", content);
+                printed += 1;
+            }
+            if printed == 0 {
+                println!("No results found.");
             }
         }
         Commands::Export {
@@ -402,5 +437,45 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_tool_lines_removes_tool_use() {
+        let input = "Here is my plan\n[tool_use: Edit] {\"file\":\"foo.rs\"}\nDone editing.";
+        assert_eq!(strip_tool_lines(input), "Here is my plan\nDone editing.");
+    }
+
+    #[test]
+    fn test_strip_tool_lines_preserves_plain_text() {
+        let input = "Just a normal message\nwith multiple lines";
+        assert_eq!(strip_tool_lines(input), input);
+    }
+
+    #[test]
+    fn test_strip_tool_lines_all_tools_becomes_empty() {
+        let input = "[tool_use: Bash] {\"command\":\"ls\"}\n[tool_use: Edit] {\"file\":\"x\"}";
+        assert_eq!(strip_tool_lines(input), "");
+    }
+
+    #[test]
+    fn test_strip_tool_lines_preserves_brackets_in_text() {
+        let input = "Use [this] syntax for arrays\n[tool_use: Write] {\"file\":\"x\"}\nEnd";
+        assert_eq!(strip_tool_lines(input), "Use [this] syntax for arrays\nEnd");
+    }
+
+    #[test]
+    fn test_strip_tool_lines_empty_input() {
+        assert_eq!(strip_tool_lines(""), "");
+    }
+
+    #[test]
+    fn test_strip_tool_lines_single_tool_line() {
+        let input = "[tool_use: Bash] {\"command\":\"cargo test\"}";
+        assert_eq!(strip_tool_lines(input), "");
     }
 }
