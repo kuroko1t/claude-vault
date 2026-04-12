@@ -114,10 +114,10 @@ fn is_noise(content: &str) -> bool {
     if trimmed.contains("Stop hook feedback:") {
         return true;
     }
-    if trimmed.contains("eval-loop iteration") || trimmed.contains("eval_commands") {
+    if trimmed.starts_with("eval-loop iteration") {
         return true;
     }
-    if trimmed.contains("# eval-loop Command") {
+    if trimmed.starts_with("# eval-loop Command") {
         return true;
     }
 
@@ -454,6 +454,9 @@ mod tests {
         assert!(is_noise("eval-loop iteration 3/30."));
         assert!(is_noise("# eval-loop Command\n\nExecute the setup..."));
         assert!(!is_noise("hello world"));
+        // Messages discussing eval-loop should NOT be filtered
+        assert!(!is_noise("The eval_commands field contains the test scripts"));
+        assert!(!is_noise("Check the eval-loop iteration results in the output"));
     }
 
     #[test]
