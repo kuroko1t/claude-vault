@@ -455,8 +455,12 @@ mod tests {
         assert!(is_noise("# eval-loop Command\n\nExecute the setup..."));
         assert!(!is_noise("hello world"));
         // Messages discussing eval-loop should NOT be filtered
-        assert!(!is_noise("The eval_commands field contains the test scripts"));
-        assert!(!is_noise("Check the eval-loop iteration results in the output"));
+        assert!(!is_noise(
+            "The eval_commands field contains the test scripts"
+        ));
+        assert!(!is_noise(
+            "Check the eval-loop iteration results in the output"
+        ));
     }
 
     #[test]
