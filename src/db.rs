@@ -64,6 +64,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_uuid
             ON messages(uuid) WHERE uuid IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_messages_session
+            ON messages(session_id, id);
         ",
     )?;
 
