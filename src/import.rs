@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::db;
@@ -124,17 +124,62 @@ fn is_noise(content: &str) -> bool {
     false
 }
 
+/// Import a whole JSONL file in one transaction. Does not record import
+/// progress; `import_all` is the incremental path.
 pub fn import_jsonl_file(conn: &Connection, path: &Path, project: &str) -> Result<ImportStats> {
-    let file =
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let (stats, _) = import_jsonl_range(&tx, path, project, 0, u64::MAX, None)?;
+    tx.commit()?;
+    Ok(stats)
+}
+
+/// Where a file's import stopped: the byte just past the last complete line
+/// consumed, and the session ID resolved so far.
+struct RangeEnd {
+    offset: u64,
+    session_id: Option<String>,
+}
+
+/// Parse and import lines from byte `start` up to at most `limit` bytes.
+///
+/// Only complete (newline-terminated) lines advance the returned offset. A
+/// trailing line without a newline is consumed only if it is already a full
+/// JSON record; otherwise it is assumed to be mid-write and is left for the
+/// next run. Caller is responsible for transaction handling.
+fn import_jsonl_range(
+    conn: &Connection,
+    path: &Path,
+    project: &str,
+    start: u64,
+    limit: u64,
+    known_session_id: Option<String>,
+) -> Result<(ImportStats, RangeEnd)> {
+    let mut file =
         fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file.take(limit));
 
     let mut stats = ImportStats::default();
-    let mut session_id: Option<String> = None;
+    let mut session_id: Option<String> = known_session_id;
     let mut first_timestamp: Option<String> = None;
+    let mut session_upserted = false;
+    let mut offset = start;
+    let mut buf: Vec<u8> = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let complete = buf.last() == Some(&b'\n');
+        let line = String::from_utf8_lossy(&buf);
+        if !complete && serde_json::from_str::<Value>(line.trim()).is_err() {
+            // Partial line still being written: stop before it.
+            break;
+        }
+        offset += n as u64;
+
         if line.trim().is_empty() {
             continue;
         }
@@ -209,7 +254,13 @@ pub fn import_jsonl_file(conn: &Connection, path: &Path, project: &str) -> Resul
                     }
                 };
 
-                db::upsert_session(conn, sid, project, first_timestamp.as_deref())?;
+                // session_id and first_timestamp are fixed once set, so one
+                // upsert per call carries everything the old per-message
+                // upsert did.
+                if !session_upserted {
+                    db::upsert_session(conn, sid, project, first_timestamp.as_deref())?;
+                    session_upserted = true;
+                }
 
                 if db::insert_message(conn, sid, uuid, role, &content, timestamp)? {
                     stats.imported += 1;
@@ -223,7 +274,7 @@ pub fn import_jsonl_file(conn: &Connection, path: &Path, project: &str) -> Resul
         }
     }
 
-    Ok(stats)
+    Ok((stats, RangeEnd { offset, session_id }))
 }
 
 #[derive(Default, Debug)]
@@ -232,6 +283,80 @@ pub struct ImportStats {
     pub skipped: usize,
     pub filtered: usize,
     pub errors: usize,
+    /// Files whose size and mtime matched the recorded state; not opened.
+    pub files_unchanged: usize,
+    /// Files that were opened and read (fully or from a saved offset).
+    pub files_read: usize,
+}
+
+fn mtime_ns(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// True when byte `offset - 1` of the file is a newline, i.e. the saved
+/// offset still sits on a line boundary. Guards against a file that was
+/// rewritten in place to the same or larger size.
+fn offset_on_line_boundary(path: &Path, offset: u64) -> bool {
+    if offset == 0 {
+        return true;
+    }
+    let mut f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut byte = [0u8; 1];
+    f.seek(SeekFrom::Start(offset - 1)).is_ok()
+        && f.read_exact(&mut byte).is_ok()
+        && byte[0] == b'\n'
+}
+
+/// Import whatever is new in one file, inside a single IMMEDIATE
+/// transaction. The saved state is re-read under the write lock, so
+/// concurrent `import` processes never redo each other's work.
+fn import_file_incremental(
+    conn: &Connection,
+    path: &Path,
+    project: &str,
+    size: u64,
+    mtime: i64,
+) -> Result<Option<ImportStats>> {
+    let key = path.to_string_lossy();
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
+    let prev = db::get_import_state(&tx, &key)?;
+    if let Some(p) = &prev {
+        if p.size as u64 == size && p.mtime_ns == mtime {
+            // Another process imported it while we waited for the lock.
+            return Ok(None);
+        }
+    }
+
+    let (start, known_sid) = match prev {
+        Some(p) if (p.offset as u64) <= size && offset_on_line_boundary(path, p.offset as u64) => {
+            (p.offset as u64, p.session_id)
+        }
+        // Truncated or rewritten: start over; uuid dedup prevents duplicates.
+        _ => (0, None),
+    };
+
+    let (stats, end) = import_jsonl_range(&tx, path, project, start, size - start, known_sid)?;
+
+    db::set_import_state(
+        &tx,
+        &key,
+        &db::ImportState {
+            size: size as i64,
+            mtime_ns: mtime,
+            offset: end.offset as i64,
+            session_id: end.session_id,
+        },
+    )?;
+    tx.commit()?;
+    Ok(Some(stats))
 }
 
 pub fn discover_jsonl_files(claude_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
@@ -280,13 +405,35 @@ pub fn import_all(conn: &Connection, claude_dir: &Path) -> Result<ImportStats> {
     let files = discover_jsonl_files(claude_dir)?;
     let mut total = ImportStats::default();
 
+    // One lock-free read of all saved progress; unchanged files are skipped
+    // without being opened or taking the write lock.
+    let states = db::load_import_states(conn)?;
+
     let file_count = files.len();
     for (i, (path, project)) in files.iter().enumerate() {
         if file_count > 10 && (i + 1) % 10 == 0 {
             eprint!("\rProcessing {}/{} files...", i + 1, file_count);
         }
-        match import_jsonl_file(conn, path, project) {
-            Ok(stats) => {
+        let meta = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                // Deleted between discovery and stat; nothing to do.
+                eprintln!("Warning: Failed to stat {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        let size = meta.len();
+        let mtime = mtime_ns(&meta);
+        if let Some(s) = states.get(path.to_string_lossy().as_ref()) {
+            if s.size as u64 == size && s.mtime_ns == mtime {
+                total.files_unchanged += 1;
+                continue;
+            }
+        }
+        match import_file_incremental(conn, path, project, size, mtime) {
+            Ok(None) => total.files_unchanged += 1,
+            Ok(Some(stats)) => {
+                total.files_read += 1;
                 total.imported += stats.imported;
                 total.skipped += stats.skipped;
                 total.filtered += stats.filtered;
@@ -303,12 +450,14 @@ pub fn import_all(conn: &Connection, claude_dir: &Path) -> Result<ImportStats> {
     }
 
     println!(
-        "Imported {} messages ({} skipped, {} filtered, {} errors) from {} files",
+        "Imported {} messages ({} skipped, {} filtered, {} errors) from {} files ({} read, {} unchanged)",
         total.imported,
         total.skipped,
         total.filtered,
         total.errors,
-        files.len()
+        files.len(),
+        total.files_read,
+        total.files_unchanged
     );
 
     Ok(total)
@@ -546,5 +695,215 @@ mod tests {
         let stats = import_jsonl_file(&conn, jsonl.path(), "proj").unwrap();
         assert_eq!(stats.imported, 1);
         assert_eq!(stats.errors, 1);
+    }
+
+    // ---- incremental import ----
+
+    fn msg_line(sid: Option<&str>, uuid: &str, ts: &str, text: &str) -> String {
+        let sid = sid
+            .map(|s| format!(r#""sessionId":"{s}","#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"type":"user",{sid}"uuid":"{uuid}","timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
+        ) + "\n"
+    }
+
+    /// A fake ~/.claude with one project containing one session file.
+    fn claude_dir_with(content: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("projects").join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let file = project.join("sess.jsonl");
+        fs::write(&file, content).unwrap();
+        (dir, file)
+    }
+
+    fn append(path: &Path, s: &str) {
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(s.as_bytes()).unwrap();
+    }
+
+    fn message_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_incremental_second_run_opens_nothing() {
+        let (conn, _db) = setup_db();
+        let content = msg_line(Some("s1"), "u1", "2024-01-01T00:00:00Z", "one")
+            + &msg_line(Some("s1"), "u2", "2024-01-01T00:00:01Z", "two");
+        let (dir, _file) = claude_dir_with(&content);
+
+        let first = import_all(&conn, dir.path()).unwrap();
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.files_read, 1);
+
+        let second = import_all(&conn, dir.path()).unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped, 0, "unchanged file must not be re-parsed");
+        assert_eq!(second.files_read, 0);
+        assert_eq!(second.files_unchanged, 1);
+        assert_eq!(message_count(&conn), 2);
+    }
+
+    #[test]
+    fn test_incremental_append_reads_only_new_bytes() {
+        let (conn, _db) = setup_db();
+        let (dir, file) =
+            claude_dir_with(&msg_line(Some("s1"), "u1", "2024-01-01T00:00:00Z", "one"));
+        import_all(&conn, dir.path()).unwrap();
+
+        append(
+            &file,
+            &msg_line(Some("s1"), "u2", "2024-01-01T00:00:01Z", "two"),
+        );
+        let stats = import_all(&conn, dir.path()).unwrap();
+        assert_eq!(stats.imported, 1);
+        // skipped == 0 proves u1 was not re-read from the start of the file
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(message_count(&conn), 2);
+
+        let st = db::get_import_state(&conn, &file.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.offset as u64, fs::metadata(&file).unwrap().len());
+    }
+
+    #[test]
+    fn test_resume_keeps_session_id_from_earlier_bytes() {
+        let (conn, _db) = setup_db();
+        let (dir, file) = claude_dir_with(&msg_line(
+            Some("real-sid"),
+            "u1",
+            "2024-01-01T00:00:00Z",
+            "one",
+        ));
+        import_all(&conn, dir.path()).unwrap();
+
+        // Appended record has no sessionId; it must not fall back to the
+        // filename stem ("sess") just because the run started mid-file.
+        append(&file, &msg_line(None, "u2", "2024-01-01T00:00:01Z", "two"));
+        import_all(&conn, dir.path()).unwrap();
+
+        let sid: String = conn
+            .query_row("SELECT session_id FROM messages WHERE uuid='u2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(sid, "real-sid");
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1);
+    }
+
+    #[test]
+    fn test_partial_trailing_line_is_deferred_until_complete() {
+        let (conn, _db) = setup_db();
+        let full = msg_line(Some("s1"), "u2", "2024-01-01T00:00:01Z", "two");
+        let (head, tail) = full.split_at(full.len() / 2);
+        let (dir, file) =
+            claude_dir_with(&(msg_line(Some("s1"), "u1", "2024-01-01T00:00:00Z", "one") + head));
+
+        let first = import_all(&conn, dir.path()).unwrap();
+        assert_eq!(first.imported, 1);
+        assert_eq!(
+            first.errors, 0,
+            "half-written line must not count as an error"
+        );
+
+        append(&file, tail);
+        let second = import_all(&conn, dir.path()).unwrap();
+        assert_eq!(second.imported, 1);
+        assert_eq!(second.errors, 0);
+        assert_eq!(message_count(&conn), 2);
+    }
+
+    #[test]
+    fn test_complete_last_line_without_newline_is_imported() {
+        let (conn, _db) = setup_db();
+        let line = msg_line(Some("s1"), "u1", "2024-01-01T00:00:00Z", "one");
+        let (dir, _file) = claude_dir_with(line.trim_end());
+        let stats = import_all(&conn, dir.path()).unwrap();
+        assert_eq!(stats.imported, 1);
+    }
+
+    #[test]
+    fn test_rewritten_file_restarts_from_zero() {
+        let (conn, _db) = setup_db();
+        let (dir, file) = claude_dir_with(
+            &(msg_line(Some("s1"), "u1", "2024-01-01T00:00:00Z", "one")
+                + &msg_line(Some("s1"), "u2", "2024-01-01T00:00:01Z", "two")),
+        );
+        import_all(&conn, dir.path()).unwrap();
+
+        // Shrunk below the saved offset: must re-read from the start.
+        fs::write(
+            &file,
+            msg_line(Some("s1"), "u3", "2024-01-01T00:00:02Z", "three"),
+        )
+        .unwrap();
+        let stats = import_all(&conn, dir.path()).unwrap();
+        assert_eq!(stats.imported, 1);
+        assert_eq!(message_count(&conn), 3);
+    }
+
+    #[test]
+    fn test_started_at_keeps_earliest() {
+        let (conn, _db) = setup_db();
+        db::upsert_session(&conn, "s1", "p", Some("2024-01-02T00:00:00Z")).unwrap();
+        db::upsert_session(&conn, "s1", "p", Some("2024-01-01T00:00:00Z")).unwrap();
+        db::upsert_session(&conn, "s1", "p", Some("2024-01-03T00:00:00Z")).unwrap();
+        db::upsert_session(&conn, "s1", "p", None).unwrap();
+        let started: String = conn
+            .query_row(
+                "SELECT started_at FROM sessions WHERE session_id='s1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(started, "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_concurrent_imports_do_not_duplicate_or_fail() {
+        let db_file = NamedTempFile::new().unwrap();
+        db::open_db(db_file.path()).unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("projects").join("proj");
+        fs::create_dir_all(&project).unwrap();
+        for f in 0..20 {
+            let mut content = String::new();
+            for m in 0..200 {
+                content += &msg_line(
+                    Some(&format!("s{f}")),
+                    &format!("u{f}-{m}"),
+                    "2024-01-01T00:00:00Z",
+                    "hello",
+                );
+            }
+            fs::write(project.join(format!("s{f}.jsonl")), content).unwrap();
+        }
+
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let db_path = db_file.path().to_path_buf();
+                let claude = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    let conn = db::open_db(&db_path).unwrap();
+                    import_all(&conn, &claude).unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<ImportStats> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let conn = db::open_db(db_file.path()).unwrap();
+        assert_eq!(message_count(&conn), 4000);
+        assert_eq!(results.iter().map(|r| r.imported).sum::<usize>(), 4000);
+        assert_eq!(results.iter().map(|r| r.errors).sum::<usize>(), 0);
+        // Each file is read by exactly one process; the rest see fresh state.
+        assert_eq!(results.iter().map(|r| r.files_read).sum::<usize>(), 20);
     }
 }
