@@ -1,4 +1,5 @@
 mod db;
+mod fts;
 mod import;
 
 use anyhow::{bail, Context, Result};
