@@ -60,6 +60,7 @@ Messages: 94562
 ## Features
 
 - **FTS5 full-text search** with Porter stemming (e.g. "running" matches "run")
+- **CJK substring search** — Chinese, Japanese, and Korean text matches on any substring (e.g. "預算")
 - **Automatic archiving** via Claude Code hooks (PreCompact + SessionEnd)
 - **Noise filtering** — strips tool results, system tags, and meta messages
 - **UUID deduplication** — safe to re-import; duplicates are skipped

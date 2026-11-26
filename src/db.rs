@@ -1,3 +1,4 @@
+use crate::fts;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -70,78 +71,64 @@ fn init_schema(conn: &Connection) -> Result<()> {
         ",
     )?;
 
-    // Create FTS table with Porter stemming, or migrate from old schema
     migrate_fts(conn)?;
-
-    conn.execute_batch(
-        "
-        CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
-            INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-        END;
-        ",
-    )?;
     Ok(())
 }
 
-/// Ensure the FTS table uses Porter stemming tokenizer.
-/// Migrates from the old tokenizer if needed.
+/// Bump when the tokenization rule or FTS schema changes; stored in
+/// `PRAGMA user_version`. Databases from older versions (0) are reindexed.
+const FTS_INDEX_VERSION: i64 = 1;
+
+/// Bring the FTS index up to `FTS_INDEX_VERSION`, rebuilding it from `messages`
+/// if needed. The index is contentless and holds `fts::index_text(content)`;
+/// inserts write to it from Rust, deletes are handled by a trigger.
 fn migrate_fts(conn: &Connection) -> Result<()> {
-    let fts_exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts')",
-        [],
-        |row| row.get(0),
-    )?;
-
-    if fts_exists {
-        // Check if the FTS table already uses porter tokenizer
-        let create_sql: String = conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        if create_sql.contains("porter") {
-            return Ok(());
-        }
-
-        // Old schema — drop and recreate with porter tokenizer
-        eprintln!("Migrating FTS index to Porter stemming tokenizer...");
-        conn.execute_batch(
-            "
-            DROP TRIGGER IF EXISTS messages_ai;
-            DROP TRIGGER IF EXISTS messages_ad;
-            DROP TRIGGER IF EXISTS messages_au;
-            DROP TABLE messages_fts;
-            ",
-        )?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == FTS_INDEX_VERSION {
+        return Ok(());
     }
 
-    conn.execute_batch(
+    let message_count: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+    if message_count > 0 {
+        eprintln!("Rebuilding FTS index for CJK search ({message_count} messages)...");
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
         "
+        DROP TRIGGER IF EXISTS messages_ai;
+        DROP TRIGGER IF EXISTS messages_ad;
+        DROP TRIGGER IF EXISTS messages_au;
+        DROP TABLE IF EXISTS messages_fts;
+
         CREATE VIRTUAL TABLE messages_fts USING fts5(
             content,
-            content_rowid='id',
-            content='messages',
+            content='',
+            contentless_delete=1,
             tokenize='porter unicode61'
         );
+
+        CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
+        END;
         ",
     )?;
-
-    // If migrating from old schema, rebuild the index from existing messages
-    if fts_exists {
-        conn.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")?;
-        eprintln!("FTS index rebuilt with Porter stemming.");
+    {
+        let mut read = tx.prepare("SELECT id, content FROM messages")?;
+        let mut write = tx.prepare("INSERT INTO messages_fts(rowid, content) VALUES (?1, ?2)")?;
+        let mut rows = read.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let content: String = row.get(1)?;
+            write.execute(params![id, fts::index_text(&content)])?;
+        }
     }
+    tx.execute_batch(&format!("PRAGMA user_version = {FTS_INDEX_VERSION}"))?;
+    tx.commit()?;
 
+    if message_count > 0 {
+        eprintln!("FTS index rebuilt.");
+    }
     Ok(())
 }
 
@@ -182,11 +169,18 @@ pub fn insert_message(
         }
     }
 
-    conn.execute(
+    // The message and its FTS row are written together so they cannot diverge.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO messages (session_id, uuid, role, content, timestamp)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![session_id, uuid, role, content, timestamp],
     )?;
+    tx.execute(
+        "INSERT INTO messages_fts(rowid, content) VALUES (?1, ?2)",
+        params![tx.last_insert_rowid(), fts::index_text(content)],
+    )?;
+    tx.commit()?;
     Ok(true)
 }
 
@@ -196,25 +190,6 @@ pub struct SearchResult {
     pub role: String,
     pub content: String,
     pub timestamp: Option<String>,
-}
-
-/// Escape a query string for safe use in FTS5 MATCH.
-/// Wraps each token in double quotes to prevent FTS5 operator interpretation.
-fn escape_fts_query(query: &str) -> String {
-    // If the user already used explicit FTS5 syntax (AND, OR, NOT, quotes), pass through
-    if query.contains('"')
-        || query.contains(" AND ")
-        || query.contains(" OR ")
-        || query.contains(" NOT ")
-    {
-        return query.to_string();
-    }
-    // Otherwise, quote each whitespace-separated token
-    query
-        .split_whitespace()
-        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Normalize a project filter so that "user/repo" also matches raw dir names like
@@ -233,7 +208,7 @@ pub fn search(
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<Vec<SearchResult>> {
-    let escaped = escape_fts_query(query);
+    let escaped = fts::match_query(query);
     if escaped.is_empty() {
         return Ok(vec![]);
     }
@@ -697,6 +672,102 @@ mod tests {
         let results = search(&conn, "configuration", 10, None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("configure"));
+    }
+
+    fn search_all(conn: &Connection, q: &str) -> Vec<SearchResult> {
+        search(conn, q, 100, None, None, None, None).unwrap()
+    }
+
+    fn db_with(messages: &[&str]) -> (Connection, NamedTempFile) {
+        let (conn, tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        for (i, m) in messages.iter().enumerate() {
+            insert_message(&conn, "s1", Some(&format!("u{i}")), "user", m, None).unwrap();
+        }
+        (conn, tmp)
+    }
+
+    #[test]
+    fn test_chinese_substring_search() {
+        let (conn, _tmp) = db_with(&["本月預算對照表已完成"]);
+        for q in ["預算", "對照表", "算對"] {
+            assert_eq!(search_all(&conn, q).len(), 1, "query {q}");
+        }
+        assert!(search_all(&conn, "預估").is_empty());
+    }
+
+    #[test]
+    fn test_japanese_substring_search() {
+        let (conn, _tmp) = db_with(&["データベースの設定を変更"]);
+        assert_eq!(search_all(&conn, "設定").len(), 1);
+    }
+
+    #[test]
+    fn test_mixed_token_and_explicit_syntax() {
+        let (conn, _tmp) = db_with(&["SRM預算對照", "只有月結", "unrelated"]);
+        assert_eq!(search_all(&conn, "SRM預算").len(), 1);
+        assert_eq!(search_all(&conn, "預算 OR 月結").len(), 2);
+    }
+
+    #[test]
+    fn test_deleted_session_not_searchable() {
+        let (conn, _tmp) = db_with(&["本月預算對照表", "english words"]);
+        delete_session(&conn, "s1").unwrap();
+        assert!(search_all(&conn, "預算").is_empty());
+        assert!(search_all(&conn, "english").is_empty());
+    }
+
+    #[test]
+    fn test_migrates_legacy_porter_index() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let old = Connection::open(tmp.path()).unwrap();
+            old.execute_batch(
+                "CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY, project TEXT NOT NULL, started_at TEXT,
+                    imported_at TEXT NOT NULL DEFAULT (datetime('now')));
+                 CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, uuid TEXT,
+                    role TEXT NOT NULL, content TEXT NOT NULL, timestamp TEXT);
+                 CREATE VIRTUAL TABLE messages_fts USING fts5(
+                    content, content_rowid='id', content='messages', tokenize='porter unicode61');
+                 CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+                 END;
+                 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+                 END;
+                 CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+                    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+                 END;
+                 INSERT INTO sessions(session_id, project) VALUES ('s1', 'proj');
+                 INSERT INTO messages(session_id, uuid, role, content)
+                    VALUES ('s1', 'u1', 'user', '本月預算對照表 running');",
+            )
+            .unwrap();
+            let hits: i64 = old
+                .query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '預算'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hits, 0, "legacy index cannot find the substring");
+        }
+
+        let conn = open_db(tmp.path()).unwrap();
+        assert_eq!(search_all(&conn, "預算").len(), 1);
+        assert_eq!(search_all(&conn, "run").len(), 1);
+
+        // Reopening must not reindex: a row removed from the index stays removed.
+        conn.execute("DELETE FROM messages_fts WHERE rowid = 1", [])
+            .unwrap();
+        drop(conn);
+        let conn = open_db(tmp.path()).unwrap();
+        assert!(search_all(&conn, "預算").is_empty());
+        insert_message(&conn, "s1", Some("u2"), "user", "新預算", None).unwrap();
+        assert_eq!(search_all(&conn, "預算").len(), 1);
     }
 
     #[test]
