@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Convert project directory names like "-home-murou-ghq-github-com-user-repo" to "user/repo"
@@ -67,6 +68,17 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_messages_session
             ON messages(session_id, id);
+
+        -- Per-file import progress, so `import` only reads bytes it has not
+        -- seen. `offset` is the byte position just past the last fully
+        -- imported line; `size`/`mtime_ns` are the file's stat at that time.
+        CREATE TABLE IF NOT EXISTS import_state (
+            path       TEXT PRIMARY KEY,
+            size       INTEGER NOT NULL,
+            mtime_ns   INTEGER NOT NULL,
+            offset     INTEGER NOT NULL,
+            session_id TEXT
+        );
         ",
     )?;
 
@@ -151,14 +163,88 @@ pub fn upsert_session(
     project: &str,
     started_at: Option<&str>,
 ) -> Result<()> {
-    conn.execute(
+    // Keep the earliest known start time. Incremental imports and subagent
+    // files that share a parent sessionId report later first-timestamps,
+    // which must not overwrite the true session start.
+    conn.prepare_cached(
         "INSERT INTO sessions (session_id, project, started_at)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(session_id) DO UPDATE SET
             project = excluded.project,
-            started_at = COALESCE(excluded.started_at, sessions.started_at)",
-        params![session_id, project, started_at],
-    )?;
+            started_at = CASE
+                WHEN sessions.started_at IS NULL THEN excluded.started_at
+                WHEN excluded.started_at IS NULL THEN sessions.started_at
+                ELSE MIN(sessions.started_at, excluded.started_at)
+            END",
+    )?
+    .execute(params![session_id, project, started_at])?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportState {
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub offset: i64,
+    pub session_id: Option<String>,
+}
+
+/// Load every file's import progress in one query (no write lock taken).
+pub fn load_import_states(conn: &Connection) -> Result<HashMap<String, ImportState>> {
+    let mut stmt =
+        conn.prepare("SELECT path, size, mtime_ns, offset, session_id FROM import_state")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ImportState {
+                size: row.get(1)?,
+                mtime_ns: row.get(2)?,
+                offset: row.get(3)?,
+                session_id: row.get(4)?,
+            },
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (path, state) = row?;
+        map.insert(path, state);
+    }
+    Ok(map)
+}
+
+pub fn get_import_state(conn: &Connection, path: &str) -> Result<Option<ImportState>> {
+    conn.prepare_cached(
+        "SELECT size, mtime_ns, offset, session_id FROM import_state WHERE path = ?1",
+    )?
+    .query_row(params![path], |row| {
+        Ok(ImportState {
+            size: row.get(0)?,
+            mtime_ns: row.get(1)?,
+            offset: row.get(2)?,
+            session_id: row.get(3)?,
+        })
+    })
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn set_import_state(conn: &Connection, path: &str, state: &ImportState) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO import_state (path, size, mtime_ns, offset, session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(path) DO UPDATE SET
+            size = excluded.size,
+            mtime_ns = excluded.mtime_ns,
+            offset = excluded.offset,
+            session_id = excluded.session_id",
+    )?
+    .execute(params![
+        path,
+        state.size,
+        state.mtime_ns,
+        state.offset,
+        state.session_id
+    ])?;
     Ok(())
 }
 
@@ -172,21 +258,19 @@ pub fn insert_message(
 ) -> Result<bool> {
     // Skip if uuid already exists
     if let Some(uuid_val) = uuid {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE uuid = ?1)",
-            params![uuid_val],
-            |row| row.get(0),
-        )?;
+        let exists: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM messages WHERE uuid = ?1)")?
+            .query_row(params![uuid_val], |row| row.get(0))?;
         if exists {
             return Ok(false);
         }
     }
 
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO messages (session_id, uuid, role, content, timestamp)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![session_id, uuid, role, content, timestamp],
-    )?;
+    )?
+    .execute(params![session_id, uuid, role, content, timestamp])?;
     Ok(true)
 }
 
