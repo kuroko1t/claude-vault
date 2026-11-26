@@ -1,6 +1,6 @@
 [package]
 name = "claude-vault"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 description = "Claude Code conversation archive tool with SQLite + FTS5"
 license = "MIT"
