@@ -127,8 +127,10 @@ fn is_noise(content: &str) -> bool {
 /// Import a whole JSONL file in one transaction. Does not record import
 /// progress; `import_all` is the incremental path.
 pub fn import_jsonl_file(conn: &Connection, path: &Path, project: &str) -> Result<ImportStats> {
+    let file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let (stats, _) = import_jsonl_range(&tx, path, project, 0, u64::MAX, None)?;
+    let (stats, _) = import_jsonl_range(&tx, file, path, project, 0, u64::MAX, None)?;
     tx.commit()?;
     Ok(stats)
 }
@@ -148,14 +150,13 @@ struct RangeEnd {
 /// next run. Caller is responsible for transaction handling.
 fn import_jsonl_range(
     conn: &Connection,
+    mut file: fs::File,
     path: &Path,
     project: &str,
     start: u64,
     limit: u64,
     known_session_id: Option<String>,
 ) -> Result<(ImportStats, RangeEnd)> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::with_capacity(256 * 1024, file.take(limit));
 
@@ -237,8 +238,12 @@ fn import_jsonl_range(
                 let uuid = record.get("uuid").and_then(|u| u.as_str());
                 let timestamp = record.get("timestamp").and_then(|t| t.as_str());
 
-                if first_timestamp.is_none() {
+                // The session row must exist before the first insert, but
+                // started_at may only show up on a later message.
+                let mut upsert_session = !session_upserted;
+                if first_timestamp.is_none() && timestamp.is_some() {
                     first_timestamp = timestamp.map(String::from);
+                    upsert_session = true;
                 }
 
                 let sid = match &session_id {
@@ -254,10 +259,11 @@ fn import_jsonl_range(
                     }
                 };
 
-                // session_id and first_timestamp are fixed once set, so one
-                // upsert per call carries everything the old per-message
+                // session_id and first_timestamp are fixed once set, so
+                // upserting on the first message and again when the first
+                // timestamp appears carries everything the old per-message
                 // upsert did.
-                if !session_upserted {
+                if upsert_session {
                     db::upsert_session(conn, sid, project, first_timestamp.as_deref())?;
                     session_upserted = true;
                 }
@@ -300,14 +306,10 @@ fn mtime_ns(meta: &fs::Metadata) -> i64 {
 /// True when byte `offset - 1` of the file is a newline, i.e. the saved
 /// offset still sits on a line boundary. Guards against a file that was
 /// rewritten in place to the same or larger size.
-fn offset_on_line_boundary(path: &Path, offset: u64) -> bool {
+fn offset_on_line_boundary(f: &mut fs::File, offset: u64) -> bool {
     if offset == 0 {
         return true;
     }
-    let mut f = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
     let mut byte = [0u8; 1];
     f.seek(SeekFrom::Start(offset - 1)).is_ok()
         && f.read_exact(&mut byte).is_ok()
@@ -315,17 +317,23 @@ fn offset_on_line_boundary(path: &Path, offset: u64) -> bool {
 }
 
 /// Import whatever is new in one file, inside a single IMMEDIATE
-/// transaction. The saved state is re-read under the write lock, so
-/// concurrent `import` processes never redo each other's work.
+/// transaction. The saved state and the file's size and mtime are both
+/// read under the write lock, so concurrent `import` processes never redo
+/// each other's work or move the saved state back to an older size.
 fn import_file_incremental(
     conn: &Connection,
     path: &Path,
     project: &str,
-    size: u64,
-    mtime: i64,
 ) -> Result<Option<ImportStats>> {
     let key = path.to_string_lossy();
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
+    // Stat the open handle that will be read, so size and bytes agree.
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let meta = file.metadata()?;
+    let size = meta.len();
+    let mtime = mtime_ns(&meta);
 
     let prev = db::get_import_state(&tx, &key)?;
     if let Some(p) = &prev {
@@ -336,14 +344,18 @@ fn import_file_incremental(
     }
 
     let (start, known_sid) = match prev {
-        Some(p) if (p.offset as u64) <= size && offset_on_line_boundary(path, p.offset as u64) => {
+        Some(p)
+            if (p.offset as u64) <= size && offset_on_line_boundary(&mut file, p.offset as u64) =>
+        {
             (p.offset as u64, p.session_id)
         }
-        // Truncated or rewritten: start over; uuid dedup prevents duplicates.
+        // Truncated or rewritten: start over. uuid dedup skips records that
+        // carry a uuid; records without one are imported again.
         _ => (0, None),
     };
 
-    let (stats, end) = import_jsonl_range(&tx, path, project, start, size - start, known_sid)?;
+    let (stats, end) =
+        import_jsonl_range(&tx, file, path, project, start, size - start, known_sid)?;
 
     db::set_import_state(
         &tx,
@@ -422,6 +434,7 @@ pub fn import_all(conn: &Connection, claude_dir: &Path) -> Result<ImportStats> {
                 continue;
             }
         };
+        // Fast skip only; import_file_incremental stats again under the lock.
         let size = meta.len();
         let mtime = mtime_ns(&meta);
         if let Some(s) = states.get(path.to_string_lossy().as_ref()) {
@@ -430,7 +443,7 @@ pub fn import_all(conn: &Connection, claude_dir: &Path) -> Result<ImportStats> {
                 continue;
             }
         }
-        match import_file_incremental(conn, path, project, size, mtime) {
+        match import_file_incremental(conn, path, project) {
             Ok(None) => total.files_unchanged += 1,
             Ok(Some(stats)) => {
                 total.files_read += 1;
@@ -864,6 +877,97 @@ mod tests {
             )
             .unwrap();
         assert_eq!(started, "2024-01-01T00:00:00Z");
+    }
+
+    fn started_at(conn: &Connection, sid: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT started_at FROM sessions WHERE session_id=?1",
+            [sid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    const NO_TS_LINE: &str = r#"{"type":"user","sessionId":"s1","uuid":"u0","message":{"role":"user","content":"no ts"}}"#;
+
+    #[test]
+    fn test_started_at_from_later_message() {
+        let (conn, _db) = setup_db();
+        let content = NO_TS_LINE.to_string()
+            + "\n"
+            + &msg_line(Some("s1"), "u1", "2024-01-01T00:00:01Z", "one");
+        let (dir, _file) = claude_dir_with(&content);
+        import_all(&conn, dir.path()).unwrap();
+        assert_eq!(
+            started_at(&conn, "s1").as_deref(),
+            Some("2024-01-01T00:00:01Z")
+        );
+    }
+
+    #[test]
+    fn test_started_at_filled_on_resumed_import() {
+        let (conn, _db) = setup_db();
+        let (dir, file) = claude_dir_with(&(NO_TS_LINE.to_string() + "\n"));
+        import_all(&conn, dir.path()).unwrap();
+        assert_eq!(started_at(&conn, "s1"), None);
+
+        // The resumed run also starts with a message without timestamp.
+        append(
+            &file,
+            &(NO_TS_LINE.replace("u0", "u0b")
+                + "\n"
+                + &msg_line(Some("s1"), "u1", "2024-01-01T00:00:01Z", "one")),
+        );
+        import_all(&conn, dir.path()).unwrap();
+        assert_eq!(
+            started_at(&conn, "s1").as_deref(),
+            Some("2024-01-01T00:00:01Z")
+        );
+    }
+
+    #[test]
+    fn test_late_lock_holder_does_not_roll_back_state() {
+        let db_file = NamedTempFile::new().unwrap();
+        db::open_db(db_file.path()).unwrap();
+
+        // Records without uuid are not deduplicated, so re-reading them
+        // from offset 0 would insert them twice.
+        let no_uuid = |text: &str| {
+            format!(
+                r#"{{"type":"user","sessionId":"s1","timestamp":"2024-01-01T00:00:00Z","message":{{"role":"user","content":"{text}"}}}}"#
+            ) + "\n"
+        };
+        let (dir, file) = claude_dir_with(&(no_uuid("one") + &no_uuid("two")));
+
+        // Hold the write lock so the importer below stats the short file
+        // and then waits for the lock.
+        let blocker = db::open_db(db_file.path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let late = {
+            let db_path = db_file.path().to_path_buf();
+            let claude = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let conn = db::open_db(&db_path).unwrap();
+                import_all(&conn, &claude).unwrap()
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // The file grows and another process imports the longer version
+        // before the waiting importer gets the lock.
+        let conn = db::open_db(db_file.path()).unwrap();
+        append(&file, &no_uuid("three"));
+        blocker.execute_batch("COMMIT").unwrap();
+        import_all(&conn, dir.path()).unwrap();
+        late.join().unwrap();
+
+        assert_eq!(message_count(&conn), 3);
+        let st = db::get_import_state(&conn, &file.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let len = fs::metadata(&file).unwrap().len();
+        assert_eq!(st.size as u64, len);
+        assert_eq!(st.offset as u64, len);
     }
 
     #[test]
